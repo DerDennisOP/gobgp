@@ -46,6 +46,7 @@ const (
 	cmdAdd            = "add"
 	cmdDel            = "del"
 	cmdAll            = "all"
+	cmdList           = "list"
 	cmdSet            = "set"
 	cmdLocal          = "local"
 	cmdAdjIn          = "adj-in"
@@ -98,6 +99,8 @@ const (
 var subOpts struct {
 	AddressFamily string `short:"a" long:"address-family" description:"specifying an address family"`
 	BatchSize     uint64 `short:"b" long:"batch-size" description:"Size of the temporary buffer in the server memory. Zero is unlimited (default)"`
+	SummaryOnly   bool   `short:"s" long:"summary-only" description:"suppress more specific routes (for aggregates)"`
+	Policy        string `short:"p" long:"policy" description:"policy name to filter contributing routes (for aggregates)"`
 }
 
 var neighborsOpts struct {

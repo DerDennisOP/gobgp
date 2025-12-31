@@ -3447,6 +3447,132 @@ func modGlobalConfig(args []string) error {
 	return err
 }
 
+func showAggregates(args []string) error {
+	var family *api.Family
+	if subOpts.AddressFamily != "" {
+		// Use specified address family
+		f, err := checkAddressFamily(nil)
+		if err != nil {
+			return err
+		}
+		family = f
+	}
+	// If no -a flag, family is nil and lists all families
+
+	stream, err := client.ListAggregate(ctx, &api.ListAggregateRequest{
+		Family: family,
+	})
+	if err != nil {
+		return err
+	}
+
+	format := "%-40s %-15d %-8s %s\n"
+	formatHeader := "%-40s %-15s %-8s %s\n"
+	fmt.Printf(formatHeader, "Prefix", "Contributors", "Summary", "Policy")
+	for {
+		r, err := stream.Recv()
+		if err != nil {
+			break
+		}
+
+		agg := r.Aggregate
+		summaryOnly := "no"
+		if agg.Aggregate.SummaryOnly {
+			summaryOnly = "yes"
+		}
+		policy := agg.Aggregate.PolicyName
+		if policy == "" {
+			policy = "-"
+		}
+
+		fmt.Printf(format,
+			agg.Aggregate.Prefix,
+			agg.NumContributors, // This is already formatted as %d in the format string below
+			summaryOnly,
+			policy,
+		)
+	}
+	return nil
+}
+
+func addAggregate(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: gobgp global aggregate add <prefix> [--summary-only] [--policy <name>]")
+	}
+
+	prefix, err := netip.ParsePrefix(args[0])
+	if err != nil {
+		return fmt.Errorf("invalid prefix: %w", err)
+	}
+
+	// Determine address family from prefix
+	var family *api.Family
+	if prefix.Addr().Is4() {
+		family = &api.Family{
+			Afi:  api.Family_AFI_IP,
+			Safi: api.Family_SAFI_UNICAST,
+		}
+	} else {
+		family = &api.Family{
+			Afi:  api.Family_AFI_IP6,
+			Safi: api.Family_SAFI_UNICAST,
+		}
+	}
+
+	_, err = client.AddAggregate(ctx, &api.AddAggregateRequest{
+		Aggregate: &api.AggregateAddress{
+			Family:      family,
+			Prefix:      prefix.String(),
+			SummaryOnly: subOpts.SummaryOnly,
+			PolicyName:  subOpts.Policy,
+		},
+	})
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Added aggregate route: %s\n", prefix)
+	return nil
+}
+
+func deleteAggregate(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: gobgp global aggregate del <prefix>")
+	}
+
+	prefix, err := netip.ParsePrefix(args[0])
+	if err != nil {
+		return fmt.Errorf("invalid prefix: %w", err)
+	}
+
+	// Determine address family from prefix
+	var family *api.Family
+	if prefix.Addr().Is4() {
+		family = &api.Family{
+			Afi:  api.Family_AFI_IP,
+			Safi: api.Family_SAFI_UNICAST,
+		}
+	} else {
+		family = &api.Family{
+			Afi:  api.Family_AFI_IP6,
+			Safi: api.Family_SAFI_UNICAST,
+		}
+	}
+
+	_, err = client.DeleteAggregate(ctx, &api.DeleteAggregateRequest{
+		Family: family,
+		Prefix: prefix.String(),
+	})
+
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Deleted aggregate route: %s\n", prefix)
+	return nil
+}
+
 func newGlobalCmd() *cobra.Command {
 	globalCmd := &cobra.Command{
 		Use: cmdGlobal,
@@ -3571,6 +3697,53 @@ func newGlobalCmd() *cobra.Command {
 	}
 	delCmd.AddCommand(allCmd)
 
-	globalCmd.AddCommand(ribCmd, policyCmd, delCmd)
+	// Aggregate commands
+	aggregateCmd := &cobra.Command{
+		Use: "aggregate",
+		Run: func(cmd *cobra.Command, args []string) {
+			if len(args) == 0 {
+				// Default: list aggregates
+				if err := showAggregates(args); err != nil {
+					exitWithError(err)
+				}
+			} else {
+				exitWithError(fmt.Errorf("usage: gobgp global aggregate { add | del | list }"))
+			}
+		},
+	}
+
+	aggregateListCmd := &cobra.Command{
+		Use: cmdList,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := showAggregates(args); err != nil {
+				exitWithError(err)
+			}
+		},
+	}
+	aggregateCmd.AddCommand(aggregateListCmd)
+
+	aggregateAddCmd := &cobra.Command{
+		Use: cmdAdd,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := addAggregate(args); err != nil {
+				exitWithError(err)
+			}
+		},
+	}
+	aggregateAddCmd.Flags().BoolVarP(&subOpts.SummaryOnly, "summary-only", "s", false, "suppress more specific routes")
+	aggregateAddCmd.Flags().StringVar(&subOpts.Policy, "policy", "", "policy name to filter contributing routes")
+	aggregateCmd.AddCommand(aggregateAddCmd)
+
+	aggregateDelCmd := &cobra.Command{
+		Use: cmdDel,
+		Run: func(cmd *cobra.Command, args []string) {
+			if err := deleteAggregate(args); err != nil {
+				exitWithError(err)
+			}
+		},
+	}
+	aggregateCmd.AddCommand(aggregateDelCmd)
+
+	globalCmd.AddCommand(ribCmd, policyCmd, delCmd, aggregateCmd)
 	return globalCmd
 }

@@ -69,6 +69,10 @@ service GoBgpService {
   rpc DeleteVrf(DeleteVrfRequest) returns (DeleteVrfResponse);
   rpc ListVrf(ListVrfRequest) returns (stream ListVrfResponse);
 
+  rpc AddAggregate(AddAggregateRequest) returns (AddAggregateResponse);
+  rpc DeleteAggregate(DeleteAggregateRequest) returns (DeleteAggregateResponse);
+  rpc ListAggregate(ListAggregateRequest) returns (stream ListAggregateResponse);
+
   rpc AddPolicy(AddPolicyRequest) returns (AddPolicyResponse);
   rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse);
   rpc ListPolicy(ListPolicyRequest) returns (stream ListPolicyResponse);
@@ -391,6 +395,40 @@ message ListVrfRequest {
 
 message ListVrfResponse {
   Vrf vrf = 1;
+}
+
+message AggregateAddress {
+  Family family = 1;
+  string prefix = 2;
+  bool summary_only = 3;
+  string policy_name = 4;
+}
+
+message AggregateAddressInfo {
+  AggregateAddress aggregate = 1;
+  uint32 num_contributors = 2;
+  repeated Path contributors = 3;
+}
+
+message AddAggregateRequest {
+  AggregateAddress aggregate = 1;
+}
+
+message AddAggregateResponse {}
+
+message DeleteAggregateRequest {
+  Family family = 1;
+  string prefix = 2;
+}
+
+message DeleteAggregateResponse {}
+
+message ListAggregateRequest {
+  Family family = 1;
+}
+
+message ListAggregateResponse {
+  AggregateAddressInfo aggregate = 1;
 }
 
 message AddPolicyRequest {

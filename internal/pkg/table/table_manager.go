@@ -149,6 +149,7 @@ type TableManager struct {
 	rfList         []bgp.Family
 	maxPathCounted atomic.Uint64
 	logger         *slog.Logger
+	aggregateManager *AggregateManager
 }
 
 func NewTableManager(logger *slog.Logger, rfList []bgp.Family) *TableManager {
@@ -163,6 +164,16 @@ func NewTableManager(logger *slog.Logger, rfList []bgp.Family) *TableManager {
 		t.tables[rf] = NewTable(logger, rf)
 	}
 	return t
+}
+
+// SetAggregateManager sets the aggregate manager for this table manager
+func (manager *TableManager) SetAggregateManager(aggMgr *AggregateManager) {
+	manager.aggregateManager = aggMgr
+}
+
+// GetAggregateManager returns the aggregate manager
+func (manager *TableManager) GetAggregateManager() *AggregateManager {
+	return manager.aggregateManager
 }
 
 // GetRFlist returns the list of routing families supported by the table manager.
@@ -257,7 +268,64 @@ func (manager *TableManager) Update(newPath *Path) []*Update {
 		for _, p := range manager.handleMacMobility(newPath) {
 			updates = append(updates, table.update(p))
 		}
+
+		// Process aggregate updates for this family
+		if manager.aggregateManager != nil {
+			aggUpdates := manager.ProcessAggregateUpdates(family)
+			updates = append(updates, aggUpdates...)
+		}
 	}
+	return updates
+}
+
+// ProcessAggregateUpdates evaluates aggregates for a family and returns any updates
+func (manager *TableManager) ProcessAggregateUpdates(family bgp.Family) []*Update {
+	if manager.aggregateManager == nil {
+		return nil
+	}
+
+	// Get all paths from the table for this family
+	table, ok := manager.tables[family]
+	if !ok {
+		return nil
+	}
+
+	// Collect all paths from the table
+	paths := make([]*Path, 0)
+	for _, shard := range table.destinations.shards {
+		shard.mu.RLock()
+		for _, dests := range shard.mp {
+			for _, dest := range dests {
+				if len(dest.knownPathList) > 0 {
+					// Include all paths for aggregate evaluation
+					paths = append(paths, dest.knownPathList...)
+				}
+			}
+		}
+		shard.mu.RUnlock()
+	}
+
+	// Update aggregates
+	aggregatePaths, err := manager.aggregateManager.UpdateTable(family, paths)
+	if err != nil {
+		manager.logger.Error("Failed to update aggregates",
+			slog.String("Topic", "Table"),
+			slog.String("Family", family.String()),
+			slog.Any("Error", err),
+		)
+		return nil
+	}
+
+	// Convert aggregate paths to table updates
+	updates := make([]*Update, 0, len(aggregatePaths))
+	for _, aggPath := range aggregatePaths {
+		// Update the table with the aggregate path
+		update := table.update(aggPath)
+		if update != nil {
+			updates = append(updates, update)
+		}
+	}
+
 	return updates
 }
 

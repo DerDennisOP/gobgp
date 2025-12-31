@@ -572,6 +572,28 @@ func filterpath(peer *peer, path, old *table.Path) *table.Path {
 }
 
 func (s *BgpServer) prePolicyFilterpath(peer *peer, path, old *table.Path) (*table.Path, *table.PolicyOptions, bool) {
+	// Filter paths suppressed by summary-only aggregates
+	if path != nil && !path.IsWithdraw {
+		aggMgr := s.globalRib.GetAggregateManager()
+		if aggMgr != nil {
+			family := path.GetFamily()
+			suppressedPaths := aggMgr.GetSuppressedPaths(family)
+			pathKey := path.GetNlri().String()
+			if suppressedPaths[pathKey] {
+				s.logger.Debug("Path suppressed by summary-only aggregate",
+					slog.String("Topic", "Aggregate"),
+					slog.String("Path", pathKey),
+					slog.String("Peer", peer.ID()),
+				)
+				// If we previously advertised this path, send a withdrawal
+				if old != nil {
+					return old.Clone(true), nil, false
+				}
+				return nil, nil, true
+			}
+		}
+	}
+
 	// Special handling for RTM NLRI.
 	if path != nil && path.GetFamily() == bgp.RF_RTC_UC && !path.IsWithdraw {
 		// If the given "path" is locally generated and the same with "old", we
@@ -2597,6 +2619,16 @@ func (s *BgpServer) StartBgp(ctx context.Context, r *api.StartBgpRequest) error 
 		if err := s.policy.Initialize(); err != nil {
 			return err
 		}
+
+		// Initialize aggregate manager (managed via CLI/API only, not config)
+		peerInfo := &table.PeerInfo{
+			AS:      c.Config.As,
+			LocalAS: c.Config.As,
+			LocalID: c.Config.RouterId,
+		}
+		aggMgr := table.NewAggregateManager(s.logger, s.policy, peerInfo)
+		s.globalRib.SetAggregateManager(aggMgr)
+
 		s.bgpConfig.Global = *c
 		// update route selection options
 		table.SelectionOptions = c.RouteSelectionOptions.Config
@@ -2720,6 +2752,144 @@ func (s *BgpServer) DeleteVrf(ctx context.Context, r *api.DeleteVrfRequest) erro
 		if len(pathList) > 0 {
 			s.propagateUpdate(nil, pathList)
 		}
+		return nil
+	}, true)
+}
+
+func (s *BgpServer) ListAggregate(ctx context.Context, r *api.ListAggregateRequest, fn func(*api.AggregateAddressInfo)) error {
+	if r == nil {
+		return fmt.Errorf("nil request")
+	}
+
+	var results []*api.AggregateAddressInfo
+	err := s.mgmtOperation(func() error {
+		aggMgr := s.globalRib.GetAggregateManager()
+		if aggMgr == nil {
+			return fmt.Errorf("aggregate manager not initialized")
+		}
+
+		var aggregates []*table.AggregateRoute
+		if r.Family != nil {
+			family := bgp.NewFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
+			aggregates = aggMgr.GetAggregates(family)
+		} else {
+			// List all aggregates across all families
+			allAggs := aggMgr.GetAllAggregates()
+			for _, aggs := range allAggs {
+				aggregates = append(aggregates, aggs...)
+			}
+		}
+
+		results = make([]*api.AggregateAddressInfo, 0, len(aggregates))
+		for _, agg := range aggregates {
+			// Determine the BGP family based on the prefix
+			var bgpFamily bgp.Family
+			if agg.GetPrefix().Addr().Is4() {
+				bgpFamily = bgp.RF_IPv4_UC
+			} else {
+				bgpFamily = bgp.RF_IPv6_UC
+			}
+
+			// Convert to API format
+			aggInfo := &api.AggregateAddressInfo{
+				Aggregate: &api.AggregateAddress{
+					Family: &api.Family{
+						Afi:  api.Family_Afi(bgpFamily.Afi()),
+						Safi: api.Family_Safi(bgpFamily.Safi()),
+					},
+					Prefix:      agg.GetPrefix().String(),
+					SummaryOnly: agg.IsSummaryOnly(),
+					PolicyName:  agg.GetPolicyName(),
+				},
+				NumContributors: uint32(len(agg.GetContributors())),
+			}
+
+			results = append(results, aggInfo)
+		}
+		return nil
+	}, true)
+
+	if err != nil {
+		return err
+	}
+
+	for _, result := range results {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+			fn(result)
+		}
+	}
+	return nil
+}
+
+func (s *BgpServer) AddAggregate(ctx context.Context, r *api.AddAggregateRequest) error {
+	if r == nil || r.Aggregate == nil {
+		return fmt.Errorf("nil request")
+	}
+
+	return s.mgmtOperation(func() error {
+		aggMgr := s.globalRib.GetAggregateManager()
+		if aggMgr == nil {
+			return fmt.Errorf("aggregate manager not initialized")
+		}
+
+		family := bgp.NewFamily(uint16(r.Aggregate.Family.Afi), uint8(r.Aggregate.Family.Safi))
+		prefix, err := netip.ParsePrefix(r.Aggregate.Prefix)
+		if err != nil {
+			return fmt.Errorf("invalid prefix: %w", err)
+		}
+
+		if err := aggMgr.AddAggregate(family, prefix, r.Aggregate.SummaryOnly, r.Aggregate.PolicyName); err != nil {
+			return err
+		}
+
+		// Trigger immediate aggregate evaluation and propagate
+		updates := s.globalRib.ProcessAggregateUpdates(family)
+		pathList := make([]*table.Path, 0)
+		for _, update := range updates {
+			pathList = append(pathList, update.KnownPathList...)
+		}
+		if len(pathList) > 0 {
+			s.propagateUpdate(nil, pathList)
+		}
+
+		return nil
+	}, true)
+}
+
+func (s *BgpServer) DeleteAggregate(ctx context.Context, r *api.DeleteAggregateRequest) error {
+	if r == nil {
+		return fmt.Errorf("nil request")
+	}
+
+	return s.mgmtOperation(func() error {
+		aggMgr := s.globalRib.GetAggregateManager()
+		if aggMgr == nil {
+			return fmt.Errorf("aggregate manager not initialized")
+		}
+
+		family := bgp.NewFamily(uint16(r.Family.Afi), uint8(r.Family.Safi))
+		prefix, err := netip.ParsePrefix(r.Prefix)
+		if err != nil {
+			return fmt.Errorf("invalid prefix: %w", err)
+		}
+
+		if err := aggMgr.DeleteAggregate(family, prefix); err != nil {
+			return err
+		}
+
+		// Trigger aggregate evaluation to withdraw the aggregate route and propagate
+		updates := s.globalRib.ProcessAggregateUpdates(family)
+		pathList := make([]*table.Path, 0)
+		for _, update := range updates {
+			pathList = append(pathList, update.KnownPathList...)
+		}
+		if len(pathList) > 0 {
+			s.propagateUpdate(nil, pathList)
+		}
+
 		return nil
 	}, true)
 }
